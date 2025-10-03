@@ -10,7 +10,8 @@ from datetime import datetime
 from typing import List, Dict
 import sys
 
-# Import the detector
+# Import the detector (same directory)
+sys.path.insert(0, str(Path(__file__).parent))
 from highway_ramp_detector import (
     GPXConverter, DataLoader, RampDetector, ResultsExporter, Config
 )
