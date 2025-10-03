@@ -44,17 +44,17 @@ class Config:
     ONRAMP_MIN_BEARING_CHANGE = 30  # degrees
     ONRAMP_OSM_PROXIMITY = 0.3      # km
     ONRAMP_MIN_BEARING_NO_OSM = 50  # degrees (stricter if no OSM)
-    
+
     # Off-ramp detection thresholds
-    OFFRAMP_MIN_SPEED_DECREASE = 20 # km/h
-    OFFRAMP_START_SPEED_MIN = 50    # km/h
-    OFFRAMP_END_SPEED_MAX = 50      # km/h
+    OFFRAMP_MIN_SPEED_DECREASE = 30 # km/h (must be significant deceleration)
+    OFFRAMP_START_SPEED_MIN = 80    # km/h (MUST be from highway speed)
+    OFFRAMP_END_SPEED_MAX = 60      # km/h (exit to ramp speed, not stopped)
     OFFRAMP_MIN_BEARING_CHANGE = 15 # degrees
     OFFRAMP_OSM_PROXIMITY = 0.15    # km (REQUIRED for off-ramps)
     
     # Analysis window
     ANALYSIS_WINDOW = 20  # Number of GPS points to analyze
-    DEDUPLICATION_WINDOW = 30  # Points within this are considered same ramp
+    DEDUPLICATION_WINDOW = 100  # Points within this are considered same ramp
 
 
 # ============================================================================
@@ -452,16 +452,17 @@ class RampDetector:
                 # Calculate bearing change
                 bearing_change = self._calculate_bearing_change(i, window)
                 
-                # Apply layered filtering
-                has_bearing = bearing_change > self.config.ONRAMP_MIN_BEARING_CHANGE
+                # MANDATORY: Require OSM proximity (just like off-ramps)
                 has_osm = nearest_ramp and min_dist < self.config.ONRAMP_OSM_PROXIMITY
                 
-                # Skip if insufficient evidence
-                if not (has_bearing or has_osm):
+                if not has_osm:
                     continue
                 
-                # If no OSM, require stronger bearing change
-                if not has_osm and bearing_change < self.config.ONRAMP_MIN_BEARING_NO_OSM:
+                # Also check for significant bearing change
+                has_bearing = bearing_change > self.config.ONRAMP_MIN_BEARING_CHANGE
+                
+                # Relax bearing requirement if very close to OSM ramp
+                if min_dist > 0.05 and not has_bearing:
                     continue
                 
                 # Calculate confidence and reasons
@@ -530,10 +531,8 @@ class RampDetector:
             avg_after = sum(speeds_after) / len(speeds_after)
             speed_decrease = avg_before - avg_after
             
-            # Check if matches off-ramp pattern
-            if (speed_decrease > self.config.OFFRAMP_MIN_SPEED_DECREASE and 
-                avg_before > self.config.OFFRAMP_START_SPEED_MIN and 
-                avg_after < self.config.OFFRAMP_END_SPEED_MAX):
+            # Check if matches off-ramp pattern (basic deceleration from elevated speed)
+            if (speed_decrease > 20 and avg_before > self.config.OFFRAMP_START_SPEED_MIN):
                 
                 mid_idx = i + window // 2
                 mid_point = self.route[mid_idx]
@@ -548,9 +547,9 @@ class RampDetector:
                 # Calculate bearing change
                 bearing_change = self._calculate_bearing_change(i, window)
                 
-                # Calculate confidence and reasons
+                # Calculate confidence and reasons (considers speed_after and decel magnitude)
                 confidence, reasons = self._calculate_offramp_confidence(
-                    speed_decrease, avg_before, bearing_change, min_dist
+                    speed_decrease, avg_before, avg_after, bearing_change, min_dist
                 )
                 
                 # Extend off-ramp segment to match on-ramp length
@@ -638,7 +637,7 @@ class RampDetector:
             # Find nearby roads (within 50m)
             for road in self.osm_roads:
                 for road_lat, road_lon in road['coords']:
-                    dist = calculate_distance(point['lat'], point['lon'], road_lat, road_lon)
+                    dist = haversine_distance(point['lat'], point['lon'], road_lat, road_lon)
                     if dist < 0.05:  # Within 50m
                         road_types_found.add(road['highway_type'])
                         break
@@ -696,21 +695,38 @@ class RampDetector:
         return min(1.0, confidence), '; '.join(reasons)
     
     def _calculate_offramp_confidence(self, speed_decrease: float, avg_before: float,
-                                      bearing_change: float, osm_dist: float) -> Tuple[float, str]:
+                                      avg_after: float, bearing_change: float, osm_dist: float) -> Tuple[float, str]:
         """Calculate confidence score and reasons for off-ramp detection"""
         confidence = 0.0
         reasons = []
         
-        if speed_decrease > 30:
+        # Higher confidence for stronger deceleration
+        if speed_decrease > 40:
             confidence += 0.4
             reasons.append(f'strong deceleration (-{speed_decrease:.1f} km/h)')
-        else:
-            confidence += 0.2
+        elif speed_decrease > 30:
+            confidence += 0.3
             reasons.append(f'deceleration (-{speed_decrease:.1f} km/h)')
+        else:
+            confidence += 0.15
+            reasons.append(f'minor deceleration (-{speed_decrease:.1f} km/h)')
         
-        if avg_before > 70:
-            confidence += 0.2
+        # Higher confidence if starting from highway speed
+        if avg_before > 90:
+            confidence += 0.3
             reasons.append('from highway speed')
+        elif avg_before > 70:
+            confidence += 0.2
+            reasons.append('from elevated speed')
+        
+        # PENALIZE if stopping completely (likely intersection, not clean off-ramp)
+        if avg_after < 5:
+            confidence -= 0.3
+            reasons.append('stops completely (possible intersection)')
+        # Boost if ending at ramp speed (typical off-ramp pattern)
+        elif 20 < avg_after < 60:
+            confidence += 0.2
+            reasons.append('ends at ramp speed')
         
         if bearing_change > 30:
             confidence += 0.3
@@ -735,16 +751,39 @@ class RampDetector:
         return ramp['destination_ref'] or ramp['destination'] or 'Unknown'
     
     def _deduplicate_ramps(self, ramps: List[Dict]) -> List[Dict]:
-        """Remove duplicate detections of the same ramp"""
+        """Remove duplicate detections of the same ramp, keeping the one with greatest speed change"""
         unique = []
-        for ramp in sorted(ramps, key=lambda x: x['confidence'], reverse=True):
-            is_duplicate = any(
-                abs(ramp['sample_order'] - existing['sample_order']) < self.config.DEDUPLICATION_WINDOW
-                for existing in unique
-            )
+        
+        # Sort by absolute speed change (highest first) to keep the most significant merge
+        for ramp in sorted(ramps, key=lambda x: abs(x['speed_change']), reverse=True):
+            # Check if this overlaps with any existing ramp
+            is_duplicate = False
+            for existing in unique:
+                # Check if segments overlap
+                segment_overlap = (
+                    ramp['segment_start'] <= existing['segment_end'] and
+                    ramp['segment_end'] >= existing['segment_start']
+                )
+                
+                # Check proximity of start points
+                start_close = abs(ramp['segment_start'] - existing['segment_start']) < self.config.DEDUPLICATION_WINDOW
+                
+                # Check proximity of end points
+                end_close = abs(ramp['segment_end'] - existing['segment_end']) < self.config.DEDUPLICATION_WINDOW
+                
+                # Check proximity of midpoints
+                midpoint_close = abs(ramp['sample_order'] - existing['sample_order']) < self.config.DEDUPLICATION_WINDOW
+                
+                # Consider duplicate if ANY proximity check matches
+                if segment_overlap or start_close or end_close or midpoint_close:
+                    is_duplicate = True
+                    break
+            
             if not is_duplicate:
                 unique.append(ramp)
-        return unique
+        
+        # Re-sort by sample order for output
+        return sorted(unique, key=lambda x: x['sample_order'])
 
 
 # ============================================================================
