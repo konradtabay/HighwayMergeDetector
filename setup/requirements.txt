@@ -1,0 +1,21 @@
+# Highway Ramp Detection System - Dependencies
+# By Konrad Tabay - tabay.konrad@gmail.com
+
+# Core dependencies
+Flask>=2.0.0
+Werkzeug>=2.0.0
+requests>=2.25.0
+python-dotenv>=0.19.0
+
+# Note: The following are built-in Python libraries (no installation needed):
+# - xml.etree.ElementTree (GPX parsing)
+# - csv (data handling)
+# - json (data handling)
+# - urllib (OSM API queries)
+# - pathlib (file operations)
+# - math (geometric calculations)
+# - time (timestamps)
+# - argparse (CLI arguments)
+# - threading (web server)
+# - webbrowser (automatic browser opening)
+
