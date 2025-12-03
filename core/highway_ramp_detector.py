@@ -20,7 +20,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 import json
-import hashlib
 import urllib.request
 import urllib.parse
 import time
@@ -68,14 +67,11 @@ class Config:
     ANALYSIS_WINDOW = 40  # Number of GPS points to analyze (doubled for longer merge segments)
     DEDUPLICATION_WINDOW = 100  # Points within this are considered same ramp
     
-    # Time gap handling
-    MAX_TIME_GAP_SECONDS = 20  # 20 seconds - if gap between consecutive points exceeds this, split trip
-    
     # Google Directions API validation
     GOOGLE_API_KEY = os.getenv('GOOGLE_MAPS_API_KEY')  # Set via environment variable
     ENABLE_GOOGLE_VALIDATION = bool(GOOGLE_API_KEY)  # Auto-enabled if API key is available
     GOOGLE_VALIDATION_TIMEOUT = 10  # seconds
-    GOOGLE_DISTANCE_TOLERANCE = 0.3  # 30% tolerance for distance comparison
+    GOOGLE_DISTANCE_TOLERANCE = 0.2  # 20% tolerance for distance comparison
 
 
 # ============================================================================
@@ -192,17 +188,16 @@ class GoogleDirectionsValidator:
     
     def _expand_offramp_window(self, merge_data: Dict, route: List[Dict]) -> Dict:
         """Expand off-ramp window to capture more context for Google validation"""
-        # For off-ramps: less before (on highway), more after (off highway)
-        # This captures more of the post-merge behavior
-        before_expansion = 10  # Reduced from 20 - less before merge
-        after_expansion = 30   # Increased from 20 - more after merge
+        # Use ±20 samples around the original detection
+        # This provides enough context for Google to detect ramp maneuvers
+        window_expansion = 20
         
         original_start = merge_data['segment_start']
         original_end = merge_data['segment_end']
         
-        # Expand window asymmetrically
-        expanded_start = max(0, original_start - before_expansion)
-        expanded_end = min(len(route), original_end + after_expansion)
+        # Expand window
+        expanded_start = max(0, original_start - window_expansion)
+        expanded_end = min(len(route), original_end + window_expansion)
         
         # Create new merge data with expanded coordinates
         expanded_merge = merge_data.copy()
@@ -218,10 +213,10 @@ class GoogleDirectionsValidator:
     def validate_merge_instance(self, merge_data: Dict, route: List[Dict]) -> Dict:
         """Validate a single merge instance using Google Directions"""
         
-        # For off-ramps and highway merges, use a wider window to capture more context
+        # For off-ramps, use a wider window to capture more context
         # This helps Google detect ramp maneuvers that might be missed in short segments
         merge_type = merge_data.get('merge_type', '')
-        if merge_type == 'off_ramp' or merge_type == 'highway_merge':
+        if merge_type == 'off_ramp':
             merge_data = self._expand_offramp_window(merge_data, route)
         
         # Extract start and end points from merge data
@@ -243,10 +238,9 @@ class GoogleDirectionsValidator:
         # Calculate actual GPS segment distance (not straight-line)
         detected_distance = self._calculate_merge_distance(merge_data, route)
         
-        # Compare with configured tolerance (30% default)
+        # Compare with 3x tolerance (much more lenient)
         distance_ratio = abs(route_info['distance'] - detected_distance) / detected_distance if detected_distance > 0 else 1.0
-        distance_tolerance = Config.GOOGLE_DISTANCE_TOLERANCE
-        distance_valid = distance_ratio <= distance_tolerance
+        distance_valid = distance_ratio <= 3.0  # 3x tolerance instead of 20%
         
         # Check if route uses highway ramps using maneuver types
         uses_ramps = self._check_highway_ramps(route_info['steps'])
@@ -259,10 +253,9 @@ class GoogleDirectionsValidator:
         has_close_osm_proximity = osm_distance_m < 20 and merge_type == 'off_ramp'
         
         # Primary requirement: MUST use ramps (or have close OSM proximity for off-ramps)
-        # AND distance must be within tolerance (30%) for validation
-        # Reject if distance is massively off (> 10x difference) as a safety check
+        # Distance must not be massively off (reject if > 10x difference)
         massive_reroute = distance_ratio > 10.0
-        is_valid = (uses_ramps or has_close_osm_proximity) and distance_valid and not massive_reroute
+        is_valid = (uses_ramps or has_close_osm_proximity) and not massive_reroute
         
         return {
             'valid': is_valid,
@@ -349,19 +342,17 @@ class GoogleDirectionsValidator:
     
     def _get_validation_reason(self, is_valid: bool, distance_valid: bool, uses_ramps: bool, distance_ratio: float, has_osm_fallback: bool = False) -> str:
         """Generate human-readable validation reason"""
-        distance_tolerance = Config.GOOGLE_DISTANCE_TOLERANCE
-        tolerance_pct = int(distance_tolerance * 100)
-        
         if is_valid:
             if uses_ramps:
-                return f"Valid: uses ramps, distance ratio {distance_ratio:.2f} (within {tolerance_pct}% tolerance)"
+                if distance_valid:
+                    return f"Valid: uses ramps, distance ratio {distance_ratio:.2f}"
+                else:
+                    return f"Valid: uses ramps (distance ratio {distance_ratio:.2f}, above 3x tolerance but acceptable)"
             elif has_osm_fallback:
-                return f"Valid: off-ramp with close OSM proximity (< 20m), distance ratio {distance_ratio:.2f} (within {tolerance_pct}% tolerance)"
+                return f"Valid: off-ramp with close OSM proximity (< 20m), distance ratio {distance_ratio:.2f}"
         else:
             if not uses_ramps and not has_osm_fallback:
                 return f"Rejected: no ramp maneuvers detected in Google route"
-            elif not distance_valid:
-                return f"Rejected: distance ratio {distance_ratio:.2f} exceeds {tolerance_pct}% tolerance"
             elif distance_ratio > 10.0:
                 return f"Rejected: massive reroute detected (distance ratio {distance_ratio:.2f} > 10x)"
             else:
@@ -527,7 +518,6 @@ class OSMQuery:
         (
           way["highway"="motorway_link"]({min_lat},{min_lon},{max_lat},{max_lon});
           way["highway"="trunk_link"]({min_lat},{min_lon},{max_lat},{max_lon});
-          way["highway"="primary_link"]({min_lat},{min_lon},{max_lat},{max_lon});
           node["highway"="motorway_junction"]({min_lat},{min_lon},{max_lat},{max_lon});
           way["highway"="motorway"]({min_lat},{min_lon},{max_lat},{max_lon});
           way["highway"="trunk"]({min_lat},{min_lon},{max_lat},{max_lon});
@@ -568,7 +558,7 @@ class OSMQuery:
                     })
                 
                 # Get ramp points (links and junctions)
-                if highway_type in ['motorway_link', 'trunk_link', 'primary_link', 'motorway_junction']:
+                if highway_type in ['motorway_link', 'trunk_link', 'motorway_junction']:
                     # Get coordinates
                     if 'lat' in element and 'lon' in element:
                         lat, lon = element['lat'], element['lon']
@@ -775,71 +765,11 @@ class RampDetector:
         else:
             print("  • Google Directions API validation disabled (no API key)")
     
-    def _get_road_types_cache_file(self) -> Path:
-        """Generate cache file path based on route hash"""
-        if not self.route:
-            return Config.DATA_DIR / "road_types_cache_empty.json"
-        
-        # Generate hash from route characteristics
-        mid_idx = len(self.route) // 2
-        route_hash = hashlib.md5(
-            f"{self.route[0]['lat']},{self.route[0]['lon']}-"
-            f"{self.route[-1]['lat']},{self.route[-1]['lon']}-"
-            f"{len(self.route)}-"
-            f"{self.route[mid_idx]['lat']},{self.route[mid_idx]['lon']}".encode()
-        ).hexdigest()[:12]
-        
-        return Config.DATA_DIR / f"road_types_cache_{route_hash}.json"
-    
-    def _load_road_types_cache(self) -> Optional[Dict[int, str]]:
-        """Load road types cache from disk"""
-        cache_file = self._get_road_types_cache_file()
-        
-        if not cache_file.exists():
-            return None
-        
-        try:
-            with open(cache_file, 'r') as f:
-                data = json.load(f)
-                # Convert string keys back to integers (JSON keys are strings)
-                cache = {int(k): v for k, v in data.items()}
-                
-                # Validate cache has expected number of entries
-                if len(cache) != len(self.route):
-                    print(f"  ⚠️  Cache size mismatch ({len(cache)} vs {len(self.route)}), recomputing...")
-                    return None
-                
-                return cache
-        except (json.JSONDecodeError, ValueError, KeyError) as e:
-            print(f"  ⚠️  Error loading cache: {e}, recomputing...")
-            return None
-    
-    def _save_road_types_cache(self, cache: Dict[int, str]):
-        """Save road types cache to disk"""
-        cache_file = self._get_road_types_cache_file()
-        
-        # Ensure data directory exists
-        Config.DATA_DIR.mkdir(exist_ok=True)
-        
-        try:
-            with open(cache_file, 'w') as f:
-                json.dump(cache, f)
-        except IOError as e:
-            print(f"  ⚠️  Error saving cache: {e}")
-    
     def _precompute_road_types(self) -> Dict[int, str]:
         """Pre-compute road types for all GPS points (cached for reuse across trips)"""
         if self._road_types_cache is not None:
             return self._road_types_cache
         
-        # Try loading from disk cache first
-        disk_cache = self._load_road_types_cache()
-        if disk_cache is not None:
-            self._road_types_cache = disk_cache
-            print(f"  ✓ Loaded road types cache from disk ({len(disk_cache)} points)")
-            return self._road_types_cache
-        
-        # No cache available, compute road types
         print("  • Pre-computing road types for all GPS points...")
         road_types_cache = {}
         for idx, point in enumerate(self.route):
@@ -848,11 +778,6 @@ class RampDetector:
             road_types_cache[idx] = self._get_road_type_at_point(point)
         
         self._road_types_cache = road_types_cache
-        
-        # Save to disk for future use
-        self._save_road_types_cache(road_types_cache)
-        print(f"  ✓ Saved road types cache to disk ({len(road_types_cache)} points)")
-        
         return road_types_cache
     
     def detect_merges(self) -> List[Dict]:
@@ -864,111 +789,41 @@ class RampDetector:
         # Pre-compute road types once globally (reused for all trips)
         road_types_cache = self._precompute_road_types()
         
-        # Group route points by trip_id, splitting at large time gaps
-        trips = {}  # {(trip_id, segment_id): [list of route indices]}
-        max_time_gap = self.config.MAX_TIME_GAP_SECONDS
-        current_segments = {}  # {trip_id: current_segment_id} - track current segment per trip
-        
+        # Group route points by trip_id
+        trips = {}  # {trip_id: [list of route indices]}
         for idx, point in enumerate(self.route):
             trip_id = point.get('trip_id', 1)
-            
-            # Check for large time gap from previous point
-            if idx > 0:
-                prev_point = self.route[idx - 1]
-                prev_trip_id = prev_point.get('trip_id', 1)
-                
-                # Calculate time difference (timestamp is in seconds)
-                time_diff = abs(point['timestamp'] - prev_point['timestamp'])
-                
-                # If same trip_id but large time gap, split into new segment
-                if trip_id == prev_trip_id and time_diff > max_time_gap:
-                    # Increment segment for this trip
-                    current_segments[trip_id] = current_segments.get(trip_id, -1) + 1
-                    segment_id = current_segments[trip_id]
-                elif trip_id == prev_trip_id:
-                    # Same trip, no gap - use current segment
-                    segment_id = current_segments.get(trip_id, 0)
-                else:
-                    # New trip - start with segment 0
-                    segment_id = 0
-                    current_segments[trip_id] = 0
-            else:
-                # First point - start with segment 0
-                segment_id = 0
-                current_segments[trip_id] = 0
-            
-            trip_key = (trip_id, segment_id)
-            if trip_key not in trips:
-                trips[trip_key] = []
-            trips[trip_key].append(idx)
+            if trip_id not in trips:
+                trips[trip_id] = []
+            trips[trip_id].append(idx)
         
-        # Count unique trips (ignoring segments)
-        unique_trips = len(set(tid for tid, _ in trips.keys()))
-        total_segments = len(trips)
-        if total_segments > unique_trips:
-            print(f"  • Found {unique_trips} trip(s) split into {total_segments} continuous segments (gaps > {max_time_gap}s filtered)")
-        else:
-            print(f"  • Found {unique_trips} trip(s) to analyze")
+        print(f"  • Found {len(trips)} trip(s) to analyze")
         
-        # Process each trip segment independently
-        for (trip_id, segment_id), trip_indices in sorted(trips.items()):
+        # Process each trip independently
+        for trip_id, trip_indices in sorted(trips.items()):
             trip_start_idx = trip_indices[0]
             trip_end_idx = trip_indices[-1]
             trip_length = len(trip_indices)
             
             # Skip trips that are too short
             if trip_length < window:
-                segment_label = f"Trip {trip_id}" if segment_id == 0 else f"Trip {trip_id} Segment {segment_id}"
-                print(f"  • Skipping {segment_label}: too short ({trip_length} < {window} points)")
-                continue
-            
-            # Verify no large time gaps within this segment
-            has_large_gap = False
-            for i in range(1, len(trip_indices)):
-                idx1 = trip_indices[i-1]
-                idx2 = trip_indices[i]
-                time_diff = abs(self.route[idx2]['timestamp'] - self.route[idx1]['timestamp'])
-                if time_diff > max_time_gap:
-                    has_large_gap = True
-                    break
-            
-            if has_large_gap:
-                segment_label = f"Trip {trip_id}" if segment_id == 0 else f"Trip {trip_id} Segment {segment_id}"
-                print(f"  • Skipping {segment_label}: contains time gap > {max_time_gap}s")
+                print(f"  • Skipping Trip {trip_id}: too short ({trip_length} < {window} points)")
                 continue
             
             total_iterations = (trip_length - window) // step_size + 1
-            segment_label = f"Trip {trip_id}" if segment_id == 0 else f"Trip {trip_id} Segment {segment_id}"
-            print(f"  • {segment_label}: analyzing {total_iterations} potential merge locations (step={step_size})...")
+            print(f"  • Trip {trip_id}: analyzing {total_iterations} potential merge locations (step={step_size})...")
             
             # Process windows only within this trip's indices
             for offset in range(0, trip_length - window, step_size):
                 # Map offset to actual route index
                 i = trip_indices[offset]
                 
-                # Check for time gaps between consecutive points within the analysis window
-                window_end_offset = int(min(offset + window, trip_length - 1))
-                has_gap_in_window = False
-                for win_offset in range(offset, window_end_offset):
-                    if win_offset + 1 >= len(trip_indices):
-                        break
-                    idx1 = trip_indices[win_offset]
-                    idx2 = trip_indices[win_offset + 1]
-                    time_diff = abs(self.route[idx2]['timestamp'] - self.route[idx1]['timestamp'])
-                    if time_diff > max_time_gap:
-                        has_gap_in_window = True
-                        break
-                
-                # Skip windows that span across large time gaps
-                if has_gap_in_window:
-                    continue
-                
                 # Progress tracking
                 if offset % 500 == 0 or offset == (trip_length - window) // step_size * step_size:
                     progress = (offset / max(1, trip_length - window)) * 100
                     print(f"    Progress: {progress:.1f}% ({offset}/{trip_length - window})")
                 
-                mid_offset = int(offset + window // 2)
+                mid_offset = offset + window // 2
                 if mid_offset >= len(trip_indices):
                     continue
                 mid_idx = trip_indices[mid_offset]
@@ -976,9 +831,9 @@ class RampDetector:
                 
                 # Extend segment to capture full merge, but stay within trip bounds
                 extended_window = window * 2
-                max_extended_offset = int(min(offset + extended_window, trip_length - 1))
+                max_extended_offset = min(offset + extended_window, trip_length - 1)
                 end_offset_idx = trip_indices[max_extended_offset] if max_extended_offset < len(trip_indices) else trip_indices[-1]
-                end_idx = int(min(end_offset_idx, trip_end_idx))
+                end_idx = min(end_offset_idx, trip_end_idx)
                 
                 # REQUIRED: Detect road type changes (mandatory for detection)
                 road_type_info = self._detect_road_type_change_cached(i, end_idx, road_types_cache)
@@ -992,35 +847,11 @@ class RampDetector:
                 if not merge_type:
                     continue  # Skip if can't classify (e.g., unknown road types)
                 
-                # For off-ramps and highway merges, adjust segment boundaries:
-                # Less points before (on highway), more points after (off highway)
-                if merge_type == 'off_ramp' or merge_type == 'highway_merge':
-                    # Adjust start to have less before (move start forward by ~10 points)
-                    points_before_reduction = 10
-                    adjusted_start_offset = int(min(offset + points_before_reduction, trip_length - 1))
-                    adjusted_start_idx = trip_indices[adjusted_start_offset] if adjusted_start_offset < len(trip_indices) else trip_indices[-1]
-                    i = int(max(adjusted_start_idx, trip_start_idx))
-                    
-                    # Extend end to have more after (extend by 20 more points)
-                    extended_window = int(window * 2.5)  # 100 points total instead of 80
-                    max_extended_offset = int(min(int(offset + extended_window), trip_length - 1))
-                    end_offset_idx = trip_indices[max_extended_offset] if max_extended_offset < len(trip_indices) else trip_indices[-1]
-                    end_idx = int(min(end_offset_idx, trip_end_idx))
-                    
-                    # Recalculate midpoint to be earlier (1/3 of window instead of 1/2)
-                    adjusted_mid_offset = int(offset + window // 3)  # ~13 points instead of 20
-                    if adjusted_mid_offset < len(trip_indices):
-                        mid_idx = trip_indices[adjusted_mid_offset]
-                        mid_point = self.route[mid_idx]
-                
                 # Find nearest OSM ramp
                 nearest_ramp, min_dist = self._find_nearest_ramp(mid_point)
                 
-                # Require OSM proximity (use stricter threshold for off-ramps and highway merges)
-                if merge_type == 'off_ramp' or merge_type == 'highway_merge':
-                    osm_threshold = self.config.OFFRAMP_OSM_PROXIMITY
-                else:
-                    osm_threshold = self.config.ONRAMP_OSM_PROXIMITY
+                # Require OSM proximity (use stricter threshold for off-ramps)
+                osm_threshold = self.config.OFFRAMP_OSM_PROXIMITY if merge_type == 'off_ramp' else self.config.ONRAMP_OSM_PROXIMITY
                 has_osm = nearest_ramp and min_dist < osm_threshold
                 
                 if not has_osm:
@@ -1030,10 +861,7 @@ class RampDetector:
                 bearing_change = self._calculate_bearing_change(i, window)
                 
                 # Check for significant bearing change
-                if merge_type == 'off_ramp' or merge_type == 'highway_merge':
-                    min_bearing = self.config.OFFRAMP_MIN_BEARING_CHANGE
-                else:
-                    min_bearing = self.config.ONRAMP_MIN_BEARING_CHANGE
+                min_bearing = self.config.OFFRAMP_MIN_BEARING_CHANGE if merge_type == 'off_ramp' else self.config.ONRAMP_MIN_BEARING_CHANGE
                 has_bearing = bearing_change > min_bearing
                 
                 # Relax bearing requirement if very close to OSM ramp
@@ -1141,31 +969,20 @@ class RampDetector:
         return deduplicated_merges
     
     def _classify_merge_type(self, road_types: List[str]) -> Optional[str]:
-        """Classify merge type based on road hierarchy direction
-        
-        Now detects highway-to-highway merges (e.g., motorway to motorway, trunk to motorway)
-        by considering motorway, trunk, and primary as highway-level roads.
-        """
+        """Classify merge type based on road hierarchy direction"""
         if len(road_types) < 2:
             return None
         
         # Define road hierarchy (higher number = higher priority/class)
-        # Highway-level roads: motorway, trunk, primary
-        # Link roads (ramps): motorway_link, trunk_link, primary_link
         hierarchy = {
             'motorway': 6,
-            'motorway_link': 5,
+            'motorway_link': 5,  # Only motorway_link counts as highway merge
             'trunk': 4,
             'trunk_link': 3,
             'primary': 2,
-            'primary_link': 1.5,
             'secondary': 1,
             'unknown': 0
         }
-        
-        # Define highway-level road types (for highway-to-highway merge detection)
-        highway_level_roads = {'motorway', 'trunk', 'primary'}
-        link_roads = {'motorway_link', 'trunk_link', 'primary_link'}
         
         # Get hierarchy values for road types
         hierarchy_values = [hierarchy.get(road_type, 0) for road_type in road_types]
@@ -1174,16 +991,9 @@ class RampDetector:
         if len(set(hierarchy_values)) < 2:
             return None  # No clear hierarchy change
         
-        # Check if this is a highway-to-highway merge
-        # This includes:
-        # 1. Transitions between highway-level roads (motorway, trunk, primary)
-        # 2. Transitions involving link roads (motorway_link, trunk_link, primary_link)
-        has_highway_level = any(rt in highway_level_roads for rt in road_types)
-        has_link_road = any(rt in link_roads for rt in road_types)
-        
-        # Only classify as merge if it involves highway-level roads or link roads
-        if not (has_highway_level or has_link_road):
-            return None  # Not a highway merge
+        # ONLY classify as highway merge if it involves motorway_link
+        if 'motorway_link' not in road_types:
+            return None  # Not a highway merge - no motorway_link involved
         
         # Find the first and last road types in the sequence
         first_road_type = road_types[0]
@@ -1200,7 +1010,6 @@ class RampDetector:
             return 'off_ramp'
         else:
             # Same hierarchy level - check if there's a clear pattern in the middle
-            # This handles highway-to-highway merges (e.g., motorway -> motorway_link -> motorway)
             # Look for the most significant transition in the sequence
             max_transition = 0
             transition_direction = 0
@@ -1214,23 +1023,12 @@ class RampDetector:
                     max_transition = transition
                     transition_direction = next_hierarchy - current_hierarchy
             
-            # For same-level transitions, check if there's a link road in between
-            # (e.g., motorway -> motorway_link -> motorway is an interchange/merge)
-            if has_link_road and max_transition > 0:
-                if transition_direction > 0:
-                    return 'on_ramp'  # Upward transition
-                elif transition_direction < 0:
-                    return 'off_ramp'  # Downward transition
-            
-            # If same level and no clear transition, check if it's highway-to-highway
-            # via a link (e.g., motorway -> motorway_link -> motorway)
-            if (first_road_type in highway_level_roads and 
-                last_road_type in highway_level_roads and 
-                has_link_road):
-                # Highway-to-highway merge via link - return new category
-                return 'highway_merge'  # New category for highway-to-highway merges
-            
-            return None  # Can't classify this transition
+            if transition_direction > 0:
+                return 'on_ramp'  # Upward transition
+            elif transition_direction < 0:
+                return 'off_ramp'  # Downward transition
+            else:
+                return None  # Can't classify this transition
     
     def _detect_road_type_change_cached(self, start_idx: int, end_idx: int, road_types_cache: Dict) -> Dict:
         """Detect sustained road type transitions using pre-computed road types"""
@@ -1269,7 +1067,6 @@ class RampDetector:
             'trunk': 'Trunk Road',
             'trunk_link': 'Trunk Link',
             'primary': 'Primary Road',
-            'primary_link': 'Primary Link',
             'secondary': 'Secondary Road'
         }
         
@@ -1351,7 +1148,6 @@ class RampDetector:
             'trunk': 'Trunk Road',
             'trunk_link': 'Trunk Link',
             'primary': 'Primary Road',
-            'primary_link': 'Primary Link',
             'secondary': 'Secondary Road'
         }
         
@@ -1434,15 +1230,21 @@ class RampDetector:
             potential_transition['to_consecutive_points'] = consecutive_count
             sustained_changes.append(potential_transition)
         
-        # Final filter: Ensure both sides truly sustained (removed motorway-to-motorway exclusion)
-        # Highway-to-highway merges are now detected (e.g., motorway to motorway via motorway_link)
+        # Final filter: Exclude motorway-to-motorway transitions and ensure both sides truly sustained
         filtered_changes = []
         for change in sustained_changes:
-            # Verify both sides sustained (should already be true, but double-check)
-            from_points = change.get('from_consecutive_points', 0)
-            to_points = change.get('to_consecutive_points', 0)
-            if from_points >= min_consecutive_points and to_points >= min_consecutive_points:
-                filtered_changes.append(change)
+            # Exclude motorway-to-motorway transitions (highway interchanges)
+            is_motorway_to_motorway = (
+                change['from_type'] in ['motorway', 'motorway_link'] and 
+                change['to_type'] in ['motorway', 'motorway_link']
+            )
+            
+            if not is_motorway_to_motorway:
+                # Verify both sides sustained (should already be true, but double-check)
+                from_points = change.get('from_consecutive_points', 0)
+                to_points = change.get('to_consecutive_points', 0)
+                if from_points >= min_consecutive_points and to_points >= min_consecutive_points:
+                    filtered_changes.append(change)
         
         return filtered_changes
     
@@ -1778,16 +1580,15 @@ def main():
     print("   Detecting merges (on-ramps and off-ramps)...")
     all_merges = detector.detect_merges()
     
-    # Separate on-ramps, off-ramps, and highway merges for reporting
+    # Separate on-ramps and off-ramps for reporting
     on_ramps = [merge for merge in all_merges if merge['merge_type'] == 'on_ramp']
     off_ramps = [merge for merge in all_merges if merge['merge_type'] == 'off_ramp']
-    highway_merges = [merge for merge in all_merges if merge['merge_type'] == 'highway_merge']
     
-    print(f"   ✓ Found {len(on_ramps)} on-ramp(s), {len(off_ramps)} off-ramp(s), and {len(highway_merges)} highway merge(s)")
+    print(f"   ✓ Found {len(on_ramps)} on-ramp(s) and {len(off_ramps)} off-ramp(s)")
     print()
     
     # Combine results
-    all_ramps = sorted(on_ramps + off_ramps + highway_merges, key=lambda x: x['sample_order'])
+    all_ramps = sorted(on_ramps + off_ramps, key=lambda x: x['sample_order'])
     
     # Export results
     print("6. Generating results...")
@@ -1805,7 +1606,6 @@ def main():
     print(f"\nDetected {len(all_ramps)} highway ramps:")
     print(f"  • {len(on_ramps)} on-ramps  (entering highway)")
     print(f"  • {len(off_ramps)} off-ramps (exiting highway)")
-    print(f"  • {len(highway_merges)} highway merges (highway-to-highway)")
     print(f"\nResults saved to 'output/' directory")
     print("=" * 70 + "\n")
 
