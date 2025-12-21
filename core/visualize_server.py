@@ -34,18 +34,6 @@ def load_trip_list() -> List[Dict]:
                         'type': 'batch'
                     })
     
-    # Check output subdirectories (new format: output/q01_1012_Y6m6-00b/ramps_detected.csv)
-    if OUTPUT_DIR.exists():
-        for trip_dir in sorted(OUTPUT_DIR.iterdir()):
-            if trip_dir.is_dir() and trip_dir.name not in ['batch', 'batch_test', 'results', 'labels']:
-                ramp_file = trip_dir / 'ramps_detected.csv'
-                if ramp_file.exists():
-                    trips.append({
-                        'name': trip_dir.name,
-                        'path': str(trip_dir),
-                        'type': 'output_subdir'
-                    })
-    
     # Check single output (for backward compatibility)
     single_ramps = OUTPUT_DIR / 'ramps_detected.csv'
     if single_ramps.exists():
@@ -67,36 +55,6 @@ def load_trip_data(trip_path: str) -> Dict:
         # Single analysis format
         route_file = Path('data/gps_route.csv')
         ramps_file = trip_dir / 'ramps_detected.csv'
-    elif trip_dir.parent.name == 'output' and trip_dir.name not in ['batch', 'batch_test', 'results', 'labels']:
-        # New format: output/q01_1012_Y6m6-00b/ramps_detected.csv
-        ramps_file = trip_dir / 'ramps_detected.csv'
-        
-        # Try to find corresponding GPS route file in input/
-        route_file = None
-        # Look for converted CSV file
-        input_dir = Path('input')
-        if input_dir.exists():
-            # Try exact match first (e.g., q01_1012_Y6m6-00b_converted.csv)
-            potential_files = [
-                input_dir / f"{trip_dir.name}_converted.csv",
-                input_dir / f"{trip_dir.name}.csv",
-            ]
-            # Also check otherdata subdirectory
-            otherdata_dir = input_dir / 'otherdata'
-            if otherdata_dir.exists():
-                potential_files.extend([
-                    otherdata_dir / f"{trip_dir.name}_converted.csv",
-                    otherdata_dir / f"{trip_dir.name}.csv",
-                ])
-            
-            for pf in potential_files:
-                if pf.exists():
-                    route_file = pf
-                    break
-        
-        # Fallback to data/gps_route.csv if not found
-        if not route_file:
-            route_file = Path('data/gps_route.csv')
     else:
         # Batch format
         route_file = None
@@ -565,10 +523,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     <div class="stat-value" id="stat-off">-</div>
                     <div class="stat-label">Off-Ramps</div>
                 </div>
-                <div class="stat-card highlight highway-merge" style="border-color: #F97316;">
-                    <div class="stat-value" id="stat-highway">-</div>
-                    <div class="stat-label">Highway Merges</div>
-                </div>
             </div>
             
             <div class="segments-list" id="segments-list">
@@ -698,7 +652,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             document.getElementById('stat-segments').textContent = segments.length;
             document.getElementById('stat-on').textContent = segments.filter(s => s.merge_type === 'on_ramp').length;
             document.getElementById('stat-off').textContent = segments.filter(s => s.merge_type === 'off_ramp').length;
-            document.getElementById('stat-highway').textContent = segments.filter(s => s.merge_type === 'highway_merge').length;
             
             // Draw route
             const routeCoords = route.map(p => [p.lat, p.lon]);
@@ -724,20 +677,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 
                 if (isRejected) {
                     // Rejected ramps - different styling
-                    if (segment.merge_type === 'highway_merge') {
-                        color = '#D97706';  // Orange for rejected highway merges
-                    } else {
                     color = segment.merge_type === 'on_ramp' ? '#6B7280' : '#9CA3AF';
-                    }
                     weight = 4;
                     opacity = 0.6;
                 } else {
                     // Valid ramps - normal styling
-                    if (segment.merge_type === 'highway_merge') {
-                        color = '#F97316';  // Orange for highway merges
-                    } else {
                     color = segment.merge_type === 'on_ramp' ? '#10A37F' : '#EF4444';
-                    }
                     weight = 6;
                     opacity = 0.85;
                 }
@@ -777,8 +722,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 currentLayers.push(segmentLine, startMarker, endMarker);
                 segmentLayers.push({line: segmentLine, start: startMarker, end: endMarker});
                 
-                const icon = segment.merge_type === 'on_ramp' ? '↗' : (segment.merge_type === 'off_ramp' ? '↘' : '⇄');
-                const typeLabel = segment.merge_type === 'on_ramp' ? 'On-Ramp' : (segment.merge_type === 'off_ramp' ? 'Off-Ramp' : 'Highway Merge');
+                const icon = segment.merge_type === 'on_ramp' ? '↗' : '↘';
+                const typeLabel = segment.merge_type === 'on_ramp' ? 'On-Ramp' : 'Off-Ramp';
                 
                 const popupContent = `
                     <div style="font-family: 'Inter', sans-serif; min-width: 320px; padding: 8px;">
@@ -906,8 +851,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 const isRejected = segment.google_rejected || false;
                 card.className = `segment-card ${segment.merge_type} ${isRejected ? 'rejected' : ''}`;
                 
-                const icon = segment.merge_type === 'on_ramp' ? '↗' : (segment.merge_type === 'off_ramp' ? '↘' : '⇄');
-                const typeLabel = segment.merge_type === 'on_ramp' ? 'On-Ramp' : (segment.merge_type === 'off_ramp' ? 'Off-Ramp' : 'Highway Merge');
+                const icon = segment.merge_type === 'on_ramp' ? '↗' : '↘';
+                const typeLabel = segment.merge_type === 'on_ramp' ? 'On-Ramp' : 'Off-Ramp';
                 const rejectionBadge = isRejected ? '<span style="background: #EF4444; color: white; padding: 2px 6px; border-radius: 4px; font-size: 10px; margin-left: 8px;">REJECTED</span>' : '';
                 
                 card.innerHTML = `
@@ -1193,7 +1138,7 @@ def api_label():
 def open_browser():
     """Open browser after short delay"""
     time.sleep(1.5)
-    webbrowser.open('http://localhost:5002')
+    webbrowser.open('http://localhost:5001')
 
 
 def main():
@@ -1201,7 +1146,7 @@ def main():
     print("HIGHWAY RAMP DETECTION - VISUALIZATION SERVER")
     print("="*70)
     print("\n Starting local server...")
-    print(" Opening browser at: http://localhost:5002")
+    print(" Opening browser at: http://localhost:5001")
     print("\n Press Ctrl+C to stop the server")
     print("="*70 + "\n")
     
@@ -1209,7 +1154,7 @@ def main():
     threading.Thread(target=open_browser, daemon=True).start()
     
     # Run server
-    app.run(host='localhost', port=5002, debug=False)
+    app.run(host='localhost', port=5001, debug=False)
 
 
 if __name__ == '__main__':
