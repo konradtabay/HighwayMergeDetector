@@ -71,62 +71,84 @@ def load_trip_data(trip_path: str) -> Dict:
             ramps_file = f
             break
     
+    # Debug: Print file paths being used
+    print(f"Loading trip data from: {trip_path}")
+    print(f"  Route file: {route_file} (exists: {route_file.exists() if route_file else False})")
+    print(f"  Ramps file: {ramps_file} (exists: {ramps_file.exists() if ramps_file else False})")
+    
     # Load route
     route = []
     if route_file and route_file.exists():
-        with open(route_file, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                route.append({
-                    'lat': float(row['latitude']),
-                    'lon': float(row['longitude']),
-                    'speed': float(row['speed_kmh']),
-                    'sample': int(row['sample_order'])
-                })
+        try:
+            with open(route_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for row_num, row in enumerate(reader, start=2):  # Start at 2 (header is row 1)
+                    try:
+                        # Skip trip_id column if present (not needed for visualization)
+                        route.append({
+                            'lat': float(row['latitude']),
+                            'lon': float(row['longitude']),
+                            'speed': float(row['speed_kmh']),
+                            'sample': int(row['sample_order'])
+                        })
+                    except (KeyError, ValueError) as e:
+                        print(f"Warning: Skipping invalid row {row_num} in route file {route_file}: {e}")
+                        continue
+        except Exception as e:
+            print(f"Error loading route file {route_file}: {e}")
+            return {'route': [], 'segments': [], 'error': f'Failed to load route: {str(e)}'}
     
     segments = []
     if ramps_file and ramps_file.exists():
-        with open(ramps_file, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                segment = {
-                    'segment_start': int(row['segment_start']),
-                    'segment_end': int(row['segment_end']),
-                    'segment_length': int(row['segment_length']),
-                    'merge_type': row['merge_type'],
-                    'confidence': float(row['confidence']),
-                    'destination': row['destination'],
-                    'speed_before': float(row['speed_before']),
-                    'speed_after': float(row['speed_after']),
-                    'speed_change': float(row['speed_change']),
-                    'bearing_change': float(row['bearing_change']),
-                    'osm_distance': int(row['osm_distance_m']),
-                    'start_lat': float(row['start_latitude']),
-                    'start_lon': float(row['start_longitude']),
-                    'end_lat': float(row['end_latitude']),
-                    'end_lon': float(row['end_longitude']),
-                    'mid_lat': float(row['midpoint_latitude']),
-                    'mid_lon': float(row['midpoint_longitude']),
-                    'road_types': row.get('road_types', ''),
-                    'reasons': row['reasons'],
-                    'google_validated': row.get('google_validated', 'False').lower() == 'true',
-                    'google_rejected': row.get('google_rejected', 'False').lower() == 'true',
-                    'rejection_reason': row.get('rejection_reason', ''),
-                    'google_uses_ramps': row.get('google_uses_ramps', 'False').lower() == 'true',
-                    'google_distance_ratio': float(row.get('google_distance_ratio', '0')) if row.get('google_distance_ratio') else 0,
-                    'google_route_distance': float(row.get('google_route_distance', '0')) if row.get('google_route_distance') else 0,
-                    'google_detected_distance': float(row.get('google_detected_distance', '0')) if row.get('google_detected_distance') else 0,
-                    'google_route_steps': int(row.get('google_route_steps', '0')) if row.get('google_route_steps') else 0
-                }
-                
-                # Build path from route
-                segment['path'] = [
-                    {'lat': p['lat'], 'lon': p['lon'], 'speed': p['speed']}
-                    for p in route
-                    if segment['segment_start'] <= p['sample'] <= segment['segment_end']
-                ]
-                
-                segments.append(segment)
+        try:
+            with open(ramps_file, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row_num, row in enumerate(reader, start=2):  # Start at 2 (header is row 1)
+                    try:
+                        segment = {
+                            'segment_start': int(row['segment_start']),
+                            'segment_end': int(row['segment_end']),
+                            'segment_length': int(row['segment_length']),
+                            'merge_type': row['merge_type'],
+                            'confidence': float(row['confidence']),
+                            'destination': row.get('destination', 'Unknown'),
+                            'speed_before': float(row['speed_before']),
+                            'speed_after': float(row['speed_after']),
+                            'speed_change': float(row['speed_change']),
+                            'bearing_change': float(row['bearing_change']),
+                            'osm_distance': int(row['osm_distance_m']),
+                            'start_lat': float(row['start_latitude']),
+                            'start_lon': float(row['start_longitude']),
+                            'end_lat': float(row['end_latitude']),
+                            'end_lon': float(row['end_longitude']),
+                            'mid_lat': float(row['midpoint_latitude']),
+                            'mid_lon': float(row['midpoint_longitude']),
+                            'road_types': row.get('road_types', ''),
+                            'reasons': row.get('reasons', ''),
+                            'google_validated': row.get('google_validated', 'False').lower() == 'true',
+                            'google_rejected': row.get('google_rejected', 'False').lower() == 'true',
+                            'rejection_reason': row.get('rejection_reason', ''),
+                            'google_uses_ramps': row.get('google_uses_ramps', 'False').lower() == 'true',
+                            'google_distance_ratio': float(row.get('google_distance_ratio', '0')) if row.get('google_distance_ratio') else 0,
+                            'google_route_distance': float(row.get('google_route_distance', '0')) if row.get('google_route_distance') else 0,
+                            'google_detected_distance': float(row.get('google_detected_distance', '0')) if row.get('google_detected_distance') else 0,
+                            'google_route_steps': int(row.get('google_route_steps', '0')) if row.get('google_route_steps') else 0
+                        }
+                        
+                        # Build path from route
+                        segment['path'] = [
+                            {'lat': p['lat'], 'lon': p['lon'], 'speed': p['speed']}
+                            for p in route
+                            if segment['segment_start'] <= p['sample'] <= segment['segment_end']
+                        ]
+                        
+                        segments.append(segment)
+                    except (KeyError, ValueError) as e:
+                        print(f"Warning: Skipping invalid row {row_num} in ramps file {ramps_file}: {e}")
+                        continue
+        except Exception as e:
+            print(f"Error loading ramps file {ramps_file}: {e}")
+            return {'route': route, 'segments': [], 'error': f'Failed to load ramps: {str(e)}'}
     
     return {
         'route': route,

@@ -22,6 +22,7 @@ from typing import List, Dict, Tuple, Optional
 import json
 import urllib.request
 import urllib.parse
+import urllib.error
 import time
 import numpy as np
 from scipy.signal import savgol_filter
@@ -332,9 +333,25 @@ class GoogleDirectionsValidator:
         # Fallback: Check HTML instructions for ramp keywords
         # This helps catch cases where Google doesn't set maneuver field
         # (common for very short routes or when already on ramp)
+        # EXCLUDE roundabout exits - they're not highway ramps
         ramp_keywords = ['ramp', 'merge', 'exit', 'off-ramp', 'on-ramp', 'merge onto']
+        roundabout_keywords = ['roundabout', 'rotary', 'traffic circle']
+        
         for step in steps:
             html_instruction = step.get('html_instructions', '').lower()
+            maneuver = step.get('maneuver', '').lower()
+            
+            # Skip if this step is related to a roundabout (exclude roundabout exits)
+            is_roundabout = (
+                any(keyword in html_instruction for keyword in roundabout_keywords) or
+                'roundabout' in maneuver or
+                'rotary' in maneuver
+            )
+            
+            if is_roundabout:
+                continue  # Skip roundabout steps - don't count their "exit" as a ramp
+            
+            # Check for ramp keywords (including "exit" but only if not from roundabout)
             if any(keyword in html_instruction for keyword in ramp_keywords):
                 return True
         
@@ -527,71 +544,112 @@ class OSMQuery:
         out geom;
         """
         
-        try:
-            print(f"  Querying OSM API for region: {min_lat:.3f},{min_lon:.3f} to {max_lat:.3f},{max_lon:.3f}")
-            
-            # Make request
-            data = urllib.parse.urlencode({'data': query}).encode('utf-8')
-            req = urllib.request.Request(OSMQuery.OVERPASS_URL, data=data)
-            req.add_header('User-Agent', 'HighwayRampDetector/1.0')
-            
-            with urllib.request.urlopen(req, timeout=30) as response:
-                result = json.loads(response.read().decode('utf-8'))
-            
-            # Parse results - both ramps and road network
-            ramps = []
-            roads = []
-            
-            for element in result.get('elements', []):
-                tags = element.get('tags', {})
-                highway_type = tags.get('highway', 'unknown')
+        # Retry logic with progressive delays for OSM API timeouts
+        # Delays: 20s, 1m, 5m, 15m
+        retry_delays = [20, 60, 300, 900]  # 20s, 1m, 5m, 15m in seconds
+        max_retries = len(retry_delays) + 1  # Initial attempt + 4 retries
+        
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    delay = retry_delays[attempt - 1]
+                    delay_str = f"{delay}s" if delay < 60 else f"{delay // 60}m"
+                    print(f"  Retrying OSM API query (attempt {attempt + 1}/{max_retries}) after {delay_str} delay...")
+                    time.sleep(delay)
+                else:
+                    print(f"  Querying OSM API for region: {min_lat:.3f},{min_lon:.3f} to {max_lat:.3f},{max_lon:.3f}")
                 
-                # Store road network geometry for road type detection
-                if 'geometry' in element:
-                    # This is a way with geometry
-                    road_coords = [(node['lat'], node['lon']) for node in element['geometry']]
-                    roads.append({
-                        'highway_type': highway_type,
-                        'coords': road_coords,
-                        'name': tags.get('name', ''),
-                        'ref': tags.get('ref', '')
-                    })
+                # Make request
+                data = urllib.parse.urlencode({'data': query}).encode('utf-8')
+                req = urllib.request.Request(OSMQuery.OVERPASS_URL, data=data)
+                req.add_header('User-Agent', 'HighwayRampDetector/1.0')
                 
-                # Get ramp points (links and junctions)
-                if highway_type in ['motorway_link', 'trunk_link', 'motorway_junction']:
-                    # Get coordinates
-                    if 'lat' in element and 'lon' in element:
-                        lat, lon = element['lat'], element['lon']
-                    elif 'center' in element:
-                        lat, lon = element['center']['lat'], element['center']['lon']
-                    elif 'geometry' in element and element['geometry']:
-                        # Use first point of way geometry
-                        lat, lon = element['geometry'][0]['lat'], element['geometry'][0]['lon']
-                    else:
-                        continue
+                with urllib.request.urlopen(req, timeout=60) as response:  # Increased timeout to 60s
+                    result = json.loads(response.read().decode('utf-8'))
+                
+                # Parse results - both ramps and road network
+                ramps = []
+                roads = []
+                
+                for element in result.get('elements', []):
+                    tags = element.get('tags', {})
+                    highway_type = tags.get('highway', 'unknown')
                     
-                    ramps.append({
-                        'lat': lat,
-                        'lon': lon,
-                        'highway_type': highway_type,
-                        'destination': tags.get('destination', ''),
-                        'destination_ref': tags.get('destination:ref', ''),
-                        'ref': tags.get('ref', ''),
-                        'name': tags.get('name', ''),
-                        'geometry': element.get('geometry', [])
-                    })
-            
-            print(f"  ✓ Found {len(ramps)} ramps and {len(roads)} road segments from OSM")
-            
-            # Store roads for road type analysis
-            OSMQuery._cached_roads = roads
-            
-            return ramps
-            
-        except Exception as e:
-            print(f"  ⚠ OSM API query failed: {e}")
-            print("  → Continuing with behavior-only detection")
-            return []
+                    # Store road network geometry for road type detection
+                    if 'geometry' in element:
+                        # This is a way with geometry
+                        road_coords = [(node['lat'], node['lon']) for node in element['geometry']]
+                        roads.append({
+                            'highway_type': highway_type,
+                            'coords': road_coords,
+                            'name': tags.get('name', ''),
+                            'ref': tags.get('ref', ''),
+                            'oneway': tags.get('oneway', 'no')  # Extract oneway tag (defaults to 'no' for two-way)
+                        })
+                    
+                    # Get ramp points (links and junctions)
+                    if highway_type in ['motorway_link', 'trunk_link', 'motorway_junction']:
+                        # Get coordinates
+                        if 'lat' in element and 'lon' in element:
+                            lat, lon = element['lat'], element['lon']
+                        elif 'center' in element:
+                            lat, lon = element['center']['lat'], element['center']['lon']
+                        elif 'geometry' in element and element['geometry']:
+                            # Use first point of way geometry
+                            lat, lon = element['geometry'][0]['lat'], element['geometry'][0]['lon']
+                        else:
+                            continue
+                        
+                        ramps.append({
+                            'lat': lat,
+                            'lon': lon,
+                            'highway_type': highway_type,
+                            'destination': tags.get('destination', ''),
+                            'destination_ref': tags.get('destination:ref', ''),
+                            'ref': tags.get('ref', ''),
+                            'name': tags.get('name', ''),
+                            'geometry': element.get('geometry', [])
+                        })
+                
+                print(f"  ✓ Found {len(ramps)} ramps and {len(roads)} road segments from OSM")
+                
+                # Store roads for road type analysis
+                OSMQuery._cached_roads = roads
+                
+                return ramps
+                
+            except urllib.error.HTTPError as e:
+                if e.code == 504 and attempt < max_retries - 1:
+                    # Gateway Timeout - retry
+                    print(f"  ⚠ OSM API Gateway Timeout (504), will retry...")
+                    continue
+                else:
+                    print(f"  ⚠ OSM API HTTP error {e.code}: {e}")
+                    if attempt == max_retries - 1:
+                        print("  → All retries exhausted. Continuing with behavior-only detection")
+                        return []
+            except urllib.error.URLError as e:
+                if attempt < max_retries - 1:
+                    print(f"  ⚠ OSM API connection error, will retry...")
+                    continue
+                else:
+                    print(f"  ⚠ OSM API connection failed: {e}")
+                    print("  → All retries exhausted. Continuing with behavior-only detection")
+                    return []
+            except Exception as e:
+                error_msg = str(e)
+                if '504' in error_msg or 'Gateway Timeout' in error_msg:
+                    if attempt < max_retries - 1:
+                        print(f"  ⚠ OSM API Gateway Timeout, will retry...")
+                        continue
+                print(f"  ⚠ OSM API query failed: {e}")
+                if attempt == max_retries - 1:
+                    print("  → All retries exhausted. Continuing with behavior-only detection")
+                    return []
+        
+        # If all retries failed
+        print("  → All retries exhausted. Continuing with behavior-only detection")
+        return []
     
     @staticmethod
     def save_osm_cache(ramps: List[Dict], cache_file: Path, bbox: Tuple[float, float, float, float]):
@@ -890,6 +948,10 @@ class RampDetector:
                 
                 # Validate road direction
                 direction_info = self._validate_road_direction(i, end_idx)
+                
+                # Reject wrong-way travel on oneway roads
+                if not direction_info['valid'] and direction_info.get('direction_match', 1.0) == 0.0:
+                    continue  # Skip this detection - wrong way on oneway road
                 
                 # Adjust confidence based on direction validation
                 if direction_info['valid']:
@@ -1291,7 +1353,8 @@ class RampDetector:
                                 road_segments.append({
                                     'road_type': road_type,
                                     'road_bearing': road_bearing,
-                                    'distance': min(dist_to_start, dist_to_end)
+                                    'distance': min(dist_to_start, dist_to_end),
+                                    'oneway': road.get('oneway', 'no')  # Include oneway from road data
                                 })
         
         if not road_segments:
@@ -1304,20 +1367,59 @@ class RampDetector:
             if bearing_diff > 180:
                 bearing_diff = 360 - bearing_diff
             
-            # Calculate match score (1.0 = perfect alignment, 0.0 = opposite direction)
-            match_score = max(0, 1.0 - (bearing_diff / 90.0))  # 90 degrees = 0 score
+            # Check if road is oneway
+            oneway_value = segment.get('oneway', 'no')
+            is_oneway = oneway_value in ['yes', '1', 'true']
+            is_reverse_oneway = oneway_value == '-1'
+            
+            if is_oneway or is_reverse_oneway:
+                # For oneway roads, check actual direction (not just angle)
+                # Road bearing direction is defined by geometry node order
+                # If reverse oneway, flip the expected direction
+                expected_bearing = segment['road_bearing']
+                if is_reverse_oneway:
+                    expected_bearing = (expected_bearing + 180) % 360
+                
+                # Calculate directional difference (accounting for wrap-around)
+                dir_diff = abs(vehicle_bearing - expected_bearing)
+                if dir_diff > 180:
+                    dir_diff = 360 - dir_diff
+                
+                # More than 135° = going wrong way on oneway road
+                if dir_diff > 135:
+                    match_score = 0.0  # Wrong way - reject
+                else:
+                    # Stricter tolerance for oneway: within 45° = good match
+                    match_score = max(0, 1.0 - (dir_diff / 45.0))
+            else:
+                # Two-way road: use current logic (more lenient)
+                match_score = max(0, 1.0 - (bearing_diff / 90.0))
+            
             direction_matches.append(match_score)
         
         # Use the best match
         best_match = max(direction_matches) if direction_matches else 0.0
         avg_match = sum(direction_matches) / len(direction_matches) if direction_matches else 0.0
         
-        # Stricter validation: require 0.7+ match (30 degrees tolerance) to prevent opposite lane false positives
-        is_valid = best_match >= 0.7
+        # Check if any segments are oneway
+        has_oneway_segment = any(
+            seg.get('oneway', 'no') in ['yes', '1', 'true', '-1'] 
+            for seg in road_segments
+        )
+        
+        # Stricter validation for oneway roads: require 0.5+ match (45 degrees tolerance)
+        # For two-way roads: require 0.7+ match (30 degrees tolerance)
+        if has_oneway_segment:
+            is_valid = best_match >= 0.5  # More lenient for oneway (45° tolerance)
+        else:
+            is_valid = best_match >= 0.7  # Stricter for two-way (30° tolerance)
         
         description = f"Direction match: {best_match:.2f}"
         if not is_valid:
-            description += " (poor alignment - possible opposite lane)"
+            if best_match == 0.0:
+                description += " (wrong way on oneway road - rejected)"
+            else:
+                description += " (poor alignment - possible opposite lane)"
         
         return {
             'valid': is_valid,
@@ -1356,6 +1458,22 @@ class RampDetector:
                     ramp['segment_end'] >= existing['segment_start']
                 )
                 
+                if segment_overlap:
+                    # Calculate overlap percentage
+                    overlap_start = max(ramp['segment_start'], existing['segment_start'])
+                    overlap_end = min(ramp['segment_end'], existing['segment_end'])
+                    overlap_length = max(0, overlap_end - overlap_start)
+                    ramp_length = ramp['segment_end'] - ramp['segment_start']
+                    existing_length = existing['segment_end'] - existing['segment_start']
+                    min_length = min(ramp_length, existing_length)
+                    overlap_percentage = (overlap_length / min_length * 100) if min_length > 0 else 0
+                    
+                    # If segments overlap significantly (>10%), they're the same physical ramp
+                    # Even if classified differently (on_ramp vs off_ramp), they're duplicates
+                    if overlap_percentage > 10:
+                        is_duplicate = True
+                        break
+                
                 # Check proximity of start points
                 start_close = abs(ramp['segment_start'] - existing['segment_start']) < self.config.DEDUPLICATION_WINDOW
                 
@@ -1378,7 +1496,7 @@ class RampDetector:
                     is_different_highway_entry = True
                 
                 # Consider duplicate only if close proximity AND not a different highway entry
-                if (segment_overlap or start_close or end_close or midpoint_close) and not is_different_highway_entry:
+                if (start_close or end_close or midpoint_close) and not is_different_highway_entry:
                     is_duplicate = True
                     break
             
