@@ -68,6 +68,9 @@ class Config:
     HIGHWAY_MERGE_OSM_PROXIMITY = 0.2  # km (more lenient than off-ramp)
     HIGHWAY_MERGE_MIN_BEARING_CHANGE = 10  # degrees (more lenient)
     
+    # Time gap threshold for disqualifying detections
+    MAX_TIME_GAP_SECONDS = 15  # Disqualify if any gap >= 15 seconds in detection segment
+    
     # Analysis window
     ANALYSIS_WINDOW = 40  # Number of GPS points to analyze (doubled for longer merge segments)
     DEDUPLICATION_WINDOW = 100  # Points within this are considered same ramp
@@ -259,8 +262,8 @@ class GoogleDirectionsValidator:
         
         # Primary requirement: MUST use ramps (or have close OSM proximity for off-ramps/highway merges)
         # For highway merges, also accept if Google route shows highway transitions
-        # Distance must not be massively off (reject if > 10x difference)
-        massive_reroute = distance_ratio > 10.0
+        # Distance must not be massively off (reject if > 1.5x difference)
+        massive_reroute = distance_ratio > 1.5
         
         # Highway merges: accept if uses ramps OR has close OSM proximity OR shows highway transition
         if merge_type == 'highway_merge':
@@ -381,8 +384,8 @@ class GoogleDirectionsValidator:
         else:
             if not uses_ramps and not has_osm_fallback:
                 return f"Rejected: no ramp maneuvers detected in Google route"
-            elif distance_ratio > 10.0:
-                return f"Rejected: massive reroute detected (distance ratio {distance_ratio:.2f} > 10x)"
+            elif distance_ratio > 1.5:
+                return f"Rejected: massive reroute detected (distance ratio {distance_ratio:.2f} > 1.5x)"
             else:
                 return f"Rejected: no ramps and distance mismatch"
 
@@ -904,6 +907,11 @@ class RampDetector:
                 end_offset_idx = trip_indices[max_extended_offset] if max_extended_offset < len(trip_indices) else trip_indices[-1]
                 end_idx = min(end_offset_idx, trip_end_idx)
                 
+                # Check for large time gaps within the detection segment
+                # Disqualify if any gap >= 15 seconds (indicates GPS loss or vehicle stop)
+                if self._has_large_time_gap(i, end_idx):
+                    continue  # Skip this detection - large time gap detected
+                
                 # REQUIRED: Detect road type changes (mandatory for detection)
                 road_type_info = self._detect_road_type_change_cached(i, end_idx, road_types_cache)
                 
@@ -1273,6 +1281,20 @@ class RampDetector:
                     closest_road_type = road['highway_type']
         
         return closest_road_type
+    
+    def _has_large_time_gap(self, start_idx: int, end_idx: int) -> bool:
+        """Check if there's a large time gap (>= threshold) within the detection segment"""
+        for i in range(start_idx, min(end_idx, len(self.route) - 1)):
+            curr_point = self.route[i]
+            next_point = self.route[i + 1]
+            
+            # Calculate time difference in seconds
+            time_diff = abs(next_point['timestamp'] - curr_point['timestamp'])
+            
+            if time_diff >= self.config.MAX_TIME_GAP_SECONDS:
+                return True  # Found a gap >= threshold
+        
+        return False  # No large gaps found
     
     def _find_sustained_road_changes(self, point_road_types: List[Dict], min_consecutive_points: int = 3) -> List[Dict]:
         """Find road type changes that are sustained for minimum consecutive points on BOTH road types"""
