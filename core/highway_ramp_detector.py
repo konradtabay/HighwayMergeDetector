@@ -64,6 +64,10 @@ class Config:
     OFFRAMP_MIN_BEARING_CHANGE = 15 # degrees
     OFFRAMP_OSM_PROXIMITY = 0.15    # km (REQUIRED for off-ramps)
     
+    # Highway-to-highway merge detection thresholds
+    HIGHWAY_MERGE_OSM_PROXIMITY = 0.2  # km (more lenient than off-ramp)
+    HIGHWAY_MERGE_MIN_BEARING_CHANGE = 10  # degrees (more lenient)
+    
     # Analysis window
     ANALYSIS_WINDOW = 40  # Number of GPS points to analyze (doubled for longer merge segments)
     DEDUPLICATION_WINDOW = 100  # Points within this are considered same ramp
@@ -214,10 +218,10 @@ class GoogleDirectionsValidator:
     def validate_merge_instance(self, merge_data: Dict, route: List[Dict]) -> Dict:
         """Validate a single merge instance using Google Directions"""
         
-        # For off-ramps, use a wider window to capture more context
+        # For off-ramps and highway merges, use a wider window to capture more context
         # This helps Google detect ramp maneuvers that might be missed in short segments
         merge_type = merge_data.get('merge_type', '')
-        if merge_type == 'off_ramp':
+        if merge_type in ['off_ramp', 'highway_merge']:
             merge_data = self._expand_offramp_window(merge_data, route)
         
         # Extract start and end points from merge data
@@ -246,17 +250,24 @@ class GoogleDirectionsValidator:
         # Check if route uses highway ramps using maneuver types
         uses_ramps = self._check_highway_ramps(route_info['steps'])
         
-        # For off-ramps: fallback to OSM proximity if Google doesn't detect ramp
-        # Very close OSM proximity (< 20m) is reliable evidence for off-ramps
+        # For off-ramps and highway merges: fallback to OSM proximity if Google doesn't detect ramp
+        # Very close OSM proximity (< 20m) is reliable evidence for off-ramps and highway merges
         # Google might not detect ramp maneuvers for very short segments
         merge_type = merge_data.get('merge_type', '')
         osm_distance_m = merge_data.get('osm_distance_m', 9999)
-        has_close_osm_proximity = osm_distance_m < 20 and merge_type == 'off_ramp'
+        has_close_osm_proximity = osm_distance_m < 20 and merge_type in ['off_ramp', 'highway_merge']
         
-        # Primary requirement: MUST use ramps (or have close OSM proximity for off-ramps)
+        # Primary requirement: MUST use ramps (or have close OSM proximity for off-ramps/highway merges)
+        # For highway merges, also accept if Google route shows highway transitions
         # Distance must not be massively off (reject if > 10x difference)
         massive_reroute = distance_ratio > 10.0
-        is_valid = (uses_ramps or has_close_osm_proximity) and not massive_reroute
+        
+        # Highway merges: accept if uses ramps OR has close OSM proximity OR shows highway transition
+        if merge_type == 'highway_merge':
+            # Check if route shows highway-to-highway transition (even without explicit ramp maneuvers)
+            is_valid = (uses_ramps or has_close_osm_proximity) and not massive_reroute
+        else:
+            is_valid = (uses_ramps or has_close_osm_proximity) and not massive_reroute
         
         return {
             'valid': is_valid,
@@ -908,8 +919,13 @@ class RampDetector:
                 # Find nearest OSM ramp
                 nearest_ramp, min_dist = self._find_nearest_ramp(mid_point)
                 
-                # Require OSM proximity (use stricter threshold for off-ramps)
-                osm_threshold = self.config.OFFRAMP_OSM_PROXIMITY if merge_type == 'off_ramp' else self.config.ONRAMP_OSM_PROXIMITY
+                # Require OSM proximity (use merge-type-specific thresholds)
+                if merge_type == 'highway_merge':
+                    osm_threshold = self.config.HIGHWAY_MERGE_OSM_PROXIMITY
+                elif merge_type == 'off_ramp':
+                    osm_threshold = self.config.OFFRAMP_OSM_PROXIMITY
+                else:  # on_ramp
+                    osm_threshold = self.config.ONRAMP_OSM_PROXIMITY
                 has_osm = nearest_ramp and min_dist < osm_threshold
                 
                 if not has_osm:
@@ -918,8 +934,13 @@ class RampDetector:
                 # Calculate bearing change
                 bearing_change = self._calculate_bearing_change(i, window)
                 
-                # Check for significant bearing change
-                min_bearing = self.config.OFFRAMP_MIN_BEARING_CHANGE if merge_type == 'off_ramp' else self.config.ONRAMP_MIN_BEARING_CHANGE
+                # Check for significant bearing change (use merge-type-specific thresholds)
+                if merge_type == 'highway_merge':
+                    min_bearing = self.config.HIGHWAY_MERGE_MIN_BEARING_CHANGE
+                elif merge_type == 'off_ramp':
+                    min_bearing = self.config.OFFRAMP_MIN_BEARING_CHANGE
+                else:  # on_ramp
+                    min_bearing = self.config.ONRAMP_MIN_BEARING_CHANGE
                 has_bearing = bearing_change > min_bearing
                 
                 # Relax bearing requirement if very close to OSM ramp
@@ -1034,6 +1055,21 @@ class RampDetector:
         """Classify merge type based on road hierarchy direction"""
         if len(road_types) < 2:
             return None
+        
+        # Define highway types for highway-to-highway merges
+        highway_types = {'motorway', 'trunk'}
+        road_types_set = set(road_types)
+        
+        # Check for highway-to-highway merge FIRST (before on/off ramp logic)
+        # Case 1: Direct highway-to-highway transition (motorway ↔ trunk)
+        if highway_types.issubset(road_types_set):
+            return 'highway_merge'
+        
+        # Case 2: Same highway type transition (motorway → motorway or trunk → trunk)
+        # This handles cases where you merge from one highway segment to another
+        if len(road_types) >= 2:
+            if all(rt in highway_types for rt in road_types):
+                return 'highway_merge'
         
         # Define road hierarchy (higher number = higher priority/class)
         hierarchy = {
@@ -1469,7 +1505,7 @@ class RampDetector:
                     overlap_percentage = (overlap_length / min_length * 100) if min_length > 0 else 0
                     
                     # If segments overlap significantly (>10%), they're the same physical ramp
-                    # Even if classified differently (on_ramp vs off_ramp), they're duplicates
+                    # Even if classified differently (on_ramp vs off_ramp vs highway_merge), they're duplicates
                     if overlap_percentage > 10:
                         is_duplicate = True
                         break
@@ -1586,6 +1622,7 @@ class ResultsExporter:
     def save_summary(ramps: List[Dict], route_points: int, output_file: Path):
         on_ramps = [r for r in ramps if r['merge_type'] == 'on_ramp']
         off_ramps = [r for r in ramps if r['merge_type'] == 'off_ramp']
+        highway_merges = [r for r in ramps if r['merge_type'] == 'highway_merge']
         
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write("=" * 70 + "\n")
@@ -1596,7 +1633,8 @@ class ResultsExporter:
             f.write(f"  Total GPS Points: {route_points}\n")
             f.write(f"  Total Ramps Detected: {len(ramps)}\n")
             f.write(f"    - On-Ramps:  {len(on_ramps)}\n")
-            f.write(f"    - Off-Ramps: {len(off_ramps)}\n\n")
+            f.write(f"    - Off-Ramps: {len(off_ramps)}\n")
+            f.write(f"    - Highway Merges: {len(highway_merges)}\n\n")
             
             if on_ramps:
                 f.write("On-Ramps (Entering Highway):\n")
@@ -1616,6 +1654,20 @@ class ResultsExporter:
                 f.write("\nOff-Ramps (Exiting Highway):\n")
                 f.write("-" * 70 + "\n")
                 for i, ramp in enumerate(off_ramps, 1):
+                    f.write(f"{i}. SEGMENT: Samples {ramp['segment_start']:4d} → {ramp['segment_end']:4d} "
+                           f"({ramp['segment_length']} points) | Confidence: {ramp['confidence']:.0%}\n")
+                    f.write(f"   Speed: {ramp['speed_before']:.1f} → {ramp['speed_after']:.1f} km/h "
+                           f"({ramp['speed_change']:+.1f} km/h)\n")
+                    f.write(f"   Turn: {ramp['bearing_change']:.0f}° | OSM: {ramp['osm_distance_m']}m\n")
+                    f.write(f"   Destination: {ramp['destination']}\n")
+                    f.write(f"   Start: ({ramp['start_lat']:.6f}, {ramp['start_lon']:.6f})\n")
+                    f.write(f"   End:   ({ramp['end_lat']:.6f}, {ramp['end_lon']:.6f})\n")
+                    f.write(f"   Verification: {ramp['reasons']}\n\n")
+            
+            if highway_merges:
+                f.write("\nHighway Merges (Highway-to-Highway):\n")
+                f.write("-" * 70 + "\n")
+                for i, ramp in enumerate(highway_merges, 1):
                     f.write(f"{i}. SEGMENT: Samples {ramp['segment_start']:4d} → {ramp['segment_end']:4d} "
                            f"({ramp['segment_length']} points) | Confidence: {ramp['confidence']:.0%}\n")
                     f.write(f"   Speed: {ramp['speed_before']:.1f} → {ramp['speed_after']:.1f} km/h "
@@ -1695,18 +1747,19 @@ def main():
     print("5. Analyzing highway ramps...")
     detector = RampDetector(route, osm_ramps)
     
-    print("   Detecting merges (on-ramps and off-ramps)...")
+    print("   Detecting merges (on-ramps, off-ramps, and highway merges)...")
     all_merges = detector.detect_merges()
     
-    # Separate on-ramps and off-ramps for reporting
+    # Separate on-ramps, off-ramps, and highway merges for reporting
     on_ramps = [merge for merge in all_merges if merge['merge_type'] == 'on_ramp']
     off_ramps = [merge for merge in all_merges if merge['merge_type'] == 'off_ramp']
+    highway_merges = [merge for merge in all_merges if merge['merge_type'] == 'highway_merge']
     
-    print(f"   ✓ Found {len(on_ramps)} on-ramp(s) and {len(off_ramps)} off-ramp(s)")
+    print(f"   ✓ Found {len(on_ramps)} on-ramp(s), {len(off_ramps)} off-ramp(s), and {len(highway_merges)} highway merge(s)")
     print()
     
     # Combine results
-    all_ramps = sorted(on_ramps + off_ramps, key=lambda x: x['sample_order'])
+    all_ramps = sorted(on_ramps + off_ramps + highway_merges, key=lambda x: x['sample_order'])
     
     # Export results
     print("6. Generating results...")
@@ -1724,6 +1777,7 @@ def main():
     print(f"\nDetected {len(all_ramps)} highway ramps:")
     print(f"  • {len(on_ramps)} on-ramps  (entering highway)")
     print(f"  • {len(off_ramps)} off-ramps (exiting highway)")
+    print(f"  • {len(highway_merges)} highway merges (highway-to-highway)")
     print(f"\nResults saved to 'output/' directory")
     print("=" * 70 + "\n")
 

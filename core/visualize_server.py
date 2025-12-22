@@ -340,6 +340,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             border-left: 4px solid #EF4444;
         }
         
+        .segment-card.highway-merge {
+            border-left: 4px solid #F97316;
+        }
+        
         .segment-card.rejected {
             opacity: 0.7;
             background: #F9FAFB;
@@ -369,6 +373,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         
         .segment-type.off-ramp {
             color: #EF4444;
+        }
+        
+        .segment-type.highway-merge {
+            color: #F97316;
         }
         
         .confidence {
@@ -674,6 +682,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             document.getElementById('stat-segments').textContent = segments.length;
             document.getElementById('stat-on').textContent = segments.filter(s => s.merge_type === 'on_ramp').length;
             document.getElementById('stat-off').textContent = segments.filter(s => s.merge_type === 'off_ramp').length;
+            document.getElementById('stat-highway').textContent = segments.filter(s => s.merge_type === 'highway_merge').length;
             
             // Draw route
             const routeCoords = route.map(p => [p.lat, p.lon]);
@@ -699,12 +708,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 
                 if (isRejected) {
                     // Rejected ramps - different styling
-                    color = segment.merge_type === 'on_ramp' ? '#6B7280' : '#9CA3AF';
+                    if (segment.merge_type === 'highway_merge') {
+                        color = '#D97706';  // Orange for rejected highway merges
+                    } else {
+                        color = segment.merge_type === 'on_ramp' ? '#6B7280' : '#9CA3AF';
+                    }
                     weight = 4;
                     opacity = 0.6;
                 } else {
                     // Valid ramps - normal styling
-                    color = segment.merge_type === 'on_ramp' ? '#10A37F' : '#EF4444';
+                    if (segment.merge_type === 'highway_merge') {
+                        color = '#F97316';  // Orange for highway merges
+                    } else {
+                        color = segment.merge_type === 'on_ramp' ? '#10A37F' : '#EF4444';
+                    }
                     weight = 6;
                     opacity = 0.85;
                 }
@@ -744,8 +761,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 currentLayers.push(segmentLine, startMarker, endMarker);
                 segmentLayers.push({line: segmentLine, start: startMarker, end: endMarker});
                 
-                const icon = segment.merge_type === 'on_ramp' ? '↗' : '↘';
-                const typeLabel = segment.merge_type === 'on_ramp' ? 'On-Ramp' : 'Off-Ramp';
+                const icon = segment.merge_type === 'on_ramp' ? '↗' : (segment.merge_type === 'off_ramp' ? '↘' : '⇄');
+                const typeLabel = segment.merge_type === 'on_ramp' ? 'On-Ramp' : (segment.merge_type === 'off_ramp' ? 'Off-Ramp' : 'Highway Merge');
                 
                 const popupContent = `
                     <div style="font-family: 'Inter', sans-serif; min-width: 320px; padding: 8px;">
@@ -873,8 +890,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 const isRejected = segment.google_rejected || false;
                 card.className = `segment-card ${segment.merge_type} ${isRejected ? 'rejected' : ''}`;
                 
-                const icon = segment.merge_type === 'on_ramp' ? '↗' : '↘';
-                const typeLabel = segment.merge_type === 'on_ramp' ? 'On-Ramp' : 'Off-Ramp';
+                const icon = segment.merge_type === 'on_ramp' ? '↗' : (segment.merge_type === 'off_ramp' ? '↘' : '⇄');
+                const typeLabel = segment.merge_type === 'on_ramp' ? 'On-Ramp' : (segment.merge_type === 'off_ramp' ? 'Off-Ramp' : 'Highway Merge');
                 const rejectionBadge = isRejected ? '<span style="background: #EF4444; color: white; padding: 2px 6px; border-radius: 4px; font-size: 10px; margin-left: 8px;">REJECTED</span>' : '';
                 
                 card.innerHTML = `
